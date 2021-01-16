@@ -30,12 +30,15 @@ import androidx.appcompat.widget.Toolbar
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.Fragment
+import androidx.fragment.app.FragmentManager
+import androidx.fragment.app.FragmentTransaction
 import androidx.lifecycle.Observer
 import androidx.viewpager2.adapter.FragmentStateAdapter
 import com.geeksville.android.GeeksvilleApplication
 import com.geeksville.android.Logging
 import com.geeksville.android.ServiceClient
 import com.geeksville.concurrent.handledLaunch
+import com.geeksville.mesh.databinding.ActivityMainBinding
 import com.geeksville.mesh.model.Channel
 import com.geeksville.mesh.model.UIViewModel
 import com.geeksville.mesh.service.*
@@ -52,7 +55,6 @@ import com.google.android.material.tabs.TabLayoutMediator
 import com.google.protobuf.InvalidProtocolBufferException
 import com.vorlonsoft.android.rate.AppRate
 import com.vorlonsoft.android.rate.StoreType
-import kotlinx.android.synthetic.main.activity_main.*
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -121,6 +123,8 @@ class MainActivity : AppCompatActivity(), Logging,
         const val RC_SELECT_DEVICE =
             13 // seems to be hardwired in CompanionDeviceManager to add 65536
     }
+
+    private lateinit var binding: ActivityMainBinding
 
     // Used to schedule a coroutine in the GUI thread
     private val mainScope = CoroutineScope(Dispatchers.Main + Job())
@@ -322,14 +326,14 @@ class MainActivity : AppCompatActivity(), Logging,
                 DataPacket(
                     "+16508675310",
                     testPayload,
-                    MeshProtos.Data.Type.OPAQUE_VALUE
+                    Portnums.PortNum.PRIVATE_APP_VALUE
                 )
             )
             m.send(
                 DataPacket(
                     "+16508675310",
                     testPayload,
-                    MeshProtos.Data.Type.CLEAR_TEXT_VALUE
+                    Portnums.PortNum.TEXT_MESSAGE_APP_VALUE
                 )
             )
         }
@@ -364,6 +368,8 @@ class MainActivity : AppCompatActivity(), Logging,
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        binding = ActivityMainBinding.inflate(layoutInflater)
+
         val prefs = UIViewModel.getPreferences(this)
         model.ownerName.value = prefs.getString("owner", "")!!
 
@@ -394,15 +400,15 @@ class MainActivity : AppCompatActivity(), Logging,
         /* setContent {
             MeshApp()
         } */
-        setContentView(R.layout.activity_main)
+        setContentView(binding.root)
 
         initToolbar()
 
-        pager.adapter = tabsAdapter
-        pager.isUserInputEnabled =
+        binding.pager.adapter = tabsAdapter
+        binding.pager.isUserInputEnabled =
             false // Gestures for screen switching doesn't work so good with the map view
         // pager.offscreenPageLimit = 0 // Don't keep any offscreen pages around, because we want to make sure our bluetooth scanning stops
-        TabLayoutMediator(tab_layout, pager) { tab, position ->
+        TabLayoutMediator(binding.tabLayout, binding.pager) { tab, position ->
             // tab.text = tabInfos[position].text // I think it looks better with icons only
             tab.icon = getDrawable(tabInfos[position].icon)
         }.attach()
@@ -600,33 +606,45 @@ class MainActivity : AppCompatActivity(), Logging,
 
     /// Called when we gain/lose a connection to our mesh radio
     private fun onMeshConnectionChanged(connected: MeshService.ConnectionState) {
-        model.isConnected.value = connected
         debug("connchange ${model.isConnected.value}")
+
         if (connected == MeshService.ConnectionState.CONNECTED) {
-
             model.meshService?.let { service ->
+
+                val oldConnection = model.isConnected.value
+                model.isConnected.value = connected
+
                 debug("Getting latest radioconfig from service")
-                model.radioConfig.value =
-                    MeshProtos.RadioConfig.parseFrom(service.radioConfig)
+                try {
+                    model.radioConfig.value =
+                        MeshProtos.RadioConfig.parseFrom(service.radioConfig)
 
-                val info = service.myNodeInfo
-                model.myNodeInfo.value = info
+                    val info = service.myNodeInfo
+                    model.myNodeInfo.value = info
 
-                val isOld = info.minAppVersion > BuildConfig.VERSION_CODE
-                if (isOld)
-                    MaterialAlertDialogBuilder(this)
-                        .setTitle(getString(R.string.app_too_old))
-                        .setMessage(getString(R.string.must_update))
-                        .setPositiveButton("Okay") { _, _ ->
-                            info("User acknowledged app is old")
-                        }
-                        .show()
+                    val isOld = info.minAppVersion > BuildConfig.VERSION_CODE
+                    if (isOld)
+                        MaterialAlertDialogBuilder(this)
+                            .setTitle(getString(R.string.app_too_old))
+                            .setMessage(getString(R.string.must_update))
+                            .setPositiveButton("Okay") { _, _ ->
+                                info("User acknowledged app is old")
+                            }
+                            .show()
 
-                updateNodesFromDevice()
+                    updateNodesFromDevice()
 
-                // we have a connection to our device now, do the channel change
-                perhapsChangeChannel()
+                    // we have a connection to our device now, do the channel change
+                    perhapsChangeChannel()
+                } catch (ex: RemoteException) {
+                    warn("Abandoning connect $ex, because we probably just lost device connection")
+                    model.isConnected.value = oldConnection
+                }
             }
+        }
+        else {
+            // For other connection states, just slam them in
+            model.isConnected.value = connected
         }
     }
 
@@ -705,11 +723,11 @@ class MainActivity : AppCompatActivity(), Logging,
                             intent.getParcelableExtra<DataPacket>(EXTRA_PAYLOAD)!!
 
                         when (payload.dataType) {
-                            MeshProtos.Data.Type.CLEAR_TEXT_VALUE -> {
+                            Portnums.PortNum.TEXT_MESSAGE_APP_VALUE -> {
                                 model.messagesState.addMessage(payload)
                             }
                             else ->
-                                errormsg("Unhandled dataType ${payload.dataType}")
+                                debug("activity only cares about text messages, ignoring dataType ${payload.dataType}")
                         }
                     }
 
@@ -734,6 +752,8 @@ class MainActivity : AppCompatActivity(), Logging,
                 }
             }
     }
+
+    private var connectionJob: Job? = null
 
     private
     val mesh = object :
@@ -777,7 +797,7 @@ class MainActivity : AppCompatActivity(), Logging,
                   at com.android.internal.os.RuntimeInit$MethodAndArgsCaller.run (RuntimeInit.java:493)
                   at com.android.internal.os.ZygoteInit.main (ZygoteInit.java:1076)
                  */
-            mainScope.handledLaunch {
+            connectionJob = mainScope.handledLaunch {
                 model.meshService = service
 
                 usbDevice?.let { usb ->
@@ -790,8 +810,9 @@ class MainActivity : AppCompatActivity(), Logging,
                 // We don't start listening for packets until after we are connected to the service
                 registerMeshReceiver()
 
-                // Init our messages table with the service's record of past text messages
-                val msgs = service.oldMessages
+                // Init our messages table with the service's record of past text messages (ignore all other message types)
+                val msgs =
+                    service.oldMessages.filter { p -> p.dataType == Portnums.PortNum.TEXT_MESSAGE_APP_VALUE }
                 debug("Service provided ${msgs.size} messages")
                 model.messagesState.setMessages(msgs)
                 val connectionState =
@@ -813,6 +834,7 @@ class MainActivity : AppCompatActivity(), Logging,
                 }
 
                 debug("connected to mesh service, isConnected=${model.isConnected.value}")
+                connectionJob = null
             }
         }
 
@@ -825,8 +847,12 @@ class MainActivity : AppCompatActivity(), Logging,
     private fun bindMeshService() {
         debug("Binding to mesh service!")
         // we bind using the well known name, to make sure 3rd party apps could also
-        if (model.meshService != null)
+        if (model.meshService != null) {
+            /* This problem can occur if we unbind, but there is already an onConnected job waiting to run.  That job runs and then makes meshService != null again
+            I think I've fixed this by cancelling connectionJob.  We'll see!
+             */
             Exceptions.reportError("meshService was supposed to be null, ignoring (but reporting a bug)")
+        }
 
         try {
             MeshService.startService(this) // Start the service so it stays running even after we unbind
@@ -836,7 +862,11 @@ class MainActivity : AppCompatActivity(), Logging,
         }
 
         // ALSO bind so we can use the api
-        mesh.connect(this, MeshService.intent, Context.BIND_AUTO_CREATE + Context.BIND_ABOVE_CLIENT)
+        mesh.connect(
+            this,
+            MeshService.createIntent(),
+            Context.BIND_AUTO_CREATE + Context.BIND_ABOVE_CLIENT
+        )
     }
 
     private fun unbindMeshService() {
@@ -844,6 +874,11 @@ class MainActivity : AppCompatActivity(), Logging,
         // it, then now is the time to unregister.
         // if we never connected, do nothing
         debug("Unbinding from mesh service!")
+        connectionJob?.let { job ->
+            connectionJob = null
+            warn("We had a pending onConnection job, so we are cancelling it")
+            job.cancel("unbinding")
+        }
         mesh.close()
         model.meshService = null
     }
@@ -879,7 +914,7 @@ class MainActivity : AppCompatActivity(), Logging,
     }
 
     private fun showSettingsPage() {
-        pager.currentItem = 5
+        binding.pager.currentItem = 5
     }
 
     override fun onCreateOptionsMenu(menu: Menu): Boolean {
@@ -905,6 +940,15 @@ class MainActivity : AppCompatActivity(), Logging,
                 Toast.makeText(applicationContext, item.title, Toast.LENGTH_SHORT).show()
                 return true
             }
+            R.id.debug -> {
+                val fragmentManager: FragmentManager = supportFragmentManager
+                val fragmentTransaction: FragmentTransaction = fragmentManager.beginTransaction()
+                val nameFragment = DebugFragment()
+                fragmentTransaction.add(R.id.mainActivityLayout, nameFragment)
+                fragmentTransaction.addToBackStack(null)
+                fragmentTransaction.commit()
+                return true
+            }
             else -> super.onOptionsItemSelected(item)
         }
     }
@@ -919,5 +963,3 @@ class MainActivity : AppCompatActivity(), Logging,
         }
     }
 }
-
-

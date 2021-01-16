@@ -6,7 +6,6 @@ import android.app.PendingIntent
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothDevice.BOND_BONDED
 import android.bluetooth.BluetoothDevice.BOND_BONDING
-import android.bluetooth.BluetoothManager
 import android.bluetooth.le.*
 import android.companion.AssociationRequest
 import android.companion.BluetoothDeviceFilter
@@ -30,16 +29,19 @@ import com.geeksville.android.GeeksvilleApplication
 import com.geeksville.android.Logging
 import com.geeksville.android.hideKeyboard
 import com.geeksville.android.isGooglePlayAvailable
-import com.geeksville.concurrent.handledLaunch
 import com.geeksville.mesh.MainActivity
 import com.geeksville.mesh.R
 import com.geeksville.mesh.android.bluetoothManager
 import com.geeksville.mesh.android.usbManager
+import com.geeksville.mesh.databinding.SettingsFragmentBinding
 import com.geeksville.mesh.model.UIViewModel
 import com.geeksville.mesh.service.BluetoothInterface
 import com.geeksville.mesh.service.MeshService
 import com.geeksville.mesh.service.RadioInterfaceService
 import com.geeksville.mesh.service.SerialInterface
+import com.geeksville.mesh.service.SoftwareUpdateService.Companion.ACTION_UPDATE_PROGRESS
+import com.geeksville.mesh.service.SoftwareUpdateService.Companion.ProgressNotStarted
+import com.geeksville.mesh.service.SoftwareUpdateService.Companion.ProgressSuccess
 import com.geeksville.util.anonymize
 import com.geeksville.util.exceptionReporter
 import com.google.android.gms.location.LocationRequest
@@ -47,12 +49,11 @@ import com.google.android.gms.location.LocationServices
 import com.google.android.gms.location.LocationSettingsRequest
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.hoho.android.usbserial.driver.UsbSerialDriver
-import kotlinx.android.synthetic.main.settings_fragment.*
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
 import java.util.regex.Pattern
+
 
 object SLogging : Logging {}
 
@@ -114,7 +115,7 @@ class BTScanModel(app: Application) : AndroidViewModel(app), Logging {
     open class DeviceListEntry(val name: String, val address: String, val bonded: Boolean) {
         val bluetoothAddress
             get() =
-                if (address[0] == 'x')
+                if (isBluetooth)
                     address.substring(1)
                 else
                     null
@@ -368,27 +369,30 @@ class BTScanModel(app: Application) : AndroidViewModel(app), Logging {
             // Handle requestng USB or bluetooth permissions for the device
             debug("Requesting permissions for the device")
 
-            if (it.isBluetooth) {
-                // Request bonding for bluetooth
-                // We ignore missing BT adapters, because it lets us run on the emulator
-                bluetoothAdapter
-                    ?.getRemoteDevice(it.bluetoothAddress)?.let { device ->
-                        requestBonding(activity, device) { state ->
-                            if (state == BOND_BONDED) {
-                                errorText.value = activity.getString(R.string.pairing_completed)
-                                changeScanSelection(
-                                    activity,
-                                    it.address
-                                )
-                            } else {
-                                errorText.value =
-                                    activity.getString(R.string.pairing_failed_try_again)
-                            }
+            exceptionReporter {
+                val bleAddress = it.bluetoothAddress
+                if (bleAddress != null) {
+                    // Request bonding for bluetooth
+                    // We ignore missing BT adapters, because it lets us run on the emulator
+                    bluetoothAdapter
+                        ?.getRemoteDevice(bleAddress)?.let { device ->
+                            requestBonding(activity, device) { state ->
+                                if (state == BOND_BONDED) {
+                                    errorText.value = activity.getString(R.string.pairing_completed)
+                                    changeScanSelection(
+                                        activity,
+                                        it.address
+                                    )
+                                } else {
+                                    errorText.value =
+                                        activity.getString(R.string.pairing_failed_try_again)
+                                }
 
-                            // Force the GUI to redraw
-                            devices.value = devices.value
+                                // Force the GUI to redraw
+                                devices.value = devices.value
+                            }
                         }
-                    }
+                }
             }
 
             if (it.isSerial) {
@@ -453,6 +457,11 @@ class BTScanModel(app: Application) : AndroidViewModel(app), Logging {
 @SuppressLint("NewApi")
 class SettingsFragment : ScreenFragment("Settings"), Logging {
 
+    private var _binding: SettingsFragmentBinding? = null
+
+    // This property is only valid between onCreateView and onDestroyView.
+    private val binding get() = _binding!!
+
     private val scanModel: BTScanModel by activityViewModels()
     private val model: UIViewModel by activityViewModels()
 
@@ -477,25 +486,13 @@ class SettingsFragment : ScreenFragment("Settings"), Logging {
     private fun doFirmwareUpdate() {
         model.meshService?.let { service ->
 
-            mainScope.handledLaunch {
-                debug("User started firmware update")
-                updateFirmwareButton.isEnabled = false // Disable until things complete
-                updateProgressBar.visibility = View.VISIBLE
-                updateProgressBar.progress = 0 // start from scratch
+            debug("User started firmware update")
+            binding.updateFirmwareButton.isEnabled = false // Disable until things complete
+            binding.updateProgressBar.visibility = View.VISIBLE
+            binding.updateProgressBar.progress = 0 // start from scratch
 
-                scanStatusText.text = "Updating firmware, wait up to eight minutes..."
-                service.startFirmwareUpdate()
-                while (service.updateStatus >= 0) {
-                    updateProgressBar.progress = service.updateStatus
-                    delay(2000) // Only check occasionally
-                }
-
-                val isSuccess = (service.updateStatus == -1)
-                scanStatusText.text =
-                    if (isSuccess) "Update successful" else "Update failed"
-                updateProgressBar.isEnabled = false
-                updateFirmwareButton.isEnabled = !isSuccess
-            }
+            // We rely on our broadcast receiver to show progress as this progresses
+            service.startFirmwareUpdate()
         }
     }
 
@@ -503,44 +500,81 @@ class SettingsFragment : ScreenFragment("Settings"), Logging {
         inflater: LayoutInflater, container: ViewGroup?,
         savedInstanceState: Bundle?
     ): View? {
-        return inflater.inflate(R.layout.settings_fragment, container, false)
+        _binding = SettingsFragmentBinding.inflate(inflater, container, false)
+        return binding.root
+    }
+
+    /// Set the correct update button configuration based on current progress
+    private fun refreshUpdateButton() {
+        debug("Reiniting the udpate button")
+        val info = model.myNodeInfo.value
+        val service = model.meshService
+        if (model.isConnected.value == MeshService.ConnectionState.CONNECTED && info != null && info.shouldUpdate && info.couldUpdate && service != null) {
+            binding.updateFirmwareButton.visibility = View.VISIBLE
+            binding.updateFirmwareButton.text =
+                getString(R.string.update_to).format(getString(R.string.cur_firmware_version))
+
+            val progress = service.updateStatus
+
+            binding.updateFirmwareButton.isEnabled =
+                (progress < 0) // if currently doing an upgrade disable button
+
+            if (progress >= 0) {
+                binding.updateProgressBar.progress = progress // update partial progress
+                binding.scanStatusText.setText(R.string.updating_firmware)
+                binding.updateProgressBar.visibility = View.VISIBLE
+            } else
+                when (progress) {
+                    ProgressSuccess -> {
+                        binding.scanStatusText.setText(R.string.update_successful)
+                        binding.updateProgressBar.visibility = View.GONE
+                    }
+                    ProgressNotStarted -> {
+                        // Do nothing - because we don't want to overwrite the status text in this case
+                        binding.updateProgressBar.visibility = View.GONE
+                    }
+                    else -> {
+                        binding.scanStatusText.setText(R.string.update_failed)
+                        binding.updateProgressBar.visibility = View.VISIBLE
+                    }
+                }
+            binding.updateProgressBar.isEnabled = false
+
+        } else {
+            binding.updateFirmwareButton.visibility = View.GONE
+            binding.updateProgressBar.visibility = View.GONE
+        }
     }
 
     private fun initNodeInfo() {
         val connected = model.isConnected.value
 
+        refreshUpdateButton()
+
         // If actively connected possibly let the user update firmware
         val info = model.myNodeInfo.value
-        if (connected == MeshService.ConnectionState.CONNECTED && info != null && info.shouldUpdate && info.couldUpdate) {
-            updateFirmwareButton.visibility = View.VISIBLE
-            updateFirmwareButton.text =
-                getString(R.string.update_to).format(getString(R.string.cur_firmware_version))
-        } else {
-            updateFirmwareButton.visibility = View.GONE
-            updateProgressBar.visibility = View.GONE
-        }
 
         when (connected) {
             MeshService.ConnectionState.CONNECTED -> {
                 val fwStr = info?.firmwareString ?: ""
-                scanStatusText.text = getString(R.string.connected_to).format(fwStr)
+                binding.scanStatusText.text = getString(R.string.connected_to).format(fwStr)
             }
             MeshService.ConnectionState.DISCONNECTED ->
-                scanStatusText.text = getString(R.string.not_connected)
+                binding.scanStatusText.text = getString(R.string.not_connected)
             MeshService.ConnectionState.DEVICE_SLEEP ->
-                scanStatusText.text = getString(R.string.connected_sleeping)
+                binding.scanStatusText.text = getString(R.string.connected_sleeping)
         }
     }
 
     /// Setup the ui widgets unrelated to BLE scanning
     private fun initCommonUI() {
         model.ownerName.observe(viewLifecycleOwner, Observer { name ->
-            usernameEditText.setText(name)
+            binding.usernameEditText.setText(name)
         })
 
         // Only let user edit their name or set software update while connected to a radio
         model.isConnected.observe(viewLifecycleOwner, Observer { connected ->
-            usernameView.isEnabled = connected == MeshService.ConnectionState.CONNECTED
+            binding.usernameView.isEnabled = connected == MeshService.ConnectionState.CONNECTED
             if (connected == MeshService.ConnectionState.DISCONNECTED)
                 model.ownerName.value = ""
             initNodeInfo()
@@ -551,13 +585,13 @@ class SettingsFragment : ScreenFragment("Settings"), Logging {
             initNodeInfo()
         })
 
-        updateFirmwareButton.setOnClickListener {
+        binding.updateFirmwareButton.setOnClickListener {
             doFirmwareUpdate()
         }
 
-        usernameEditText.on(EditorInfo.IME_ACTION_DONE) {
+        binding.usernameEditText.on(EditorInfo.IME_ACTION_DONE) {
             debug("did IME action")
-            val n = usernameEditText.text.toString().trim()
+            val n = binding.usernameEditText.text.toString().trim()
             if (n.isNotEmpty())
                 model.setOwner(n)
 
@@ -567,17 +601,17 @@ class SettingsFragment : ScreenFragment("Settings"), Logging {
         val app = (requireContext().applicationContext as GeeksvilleApplication)
 
         // Set analytics checkbox
-        analyticsOkayCheckbox.isChecked = app.isAnalyticsAllowed
+        binding.analyticsOkayCheckbox.isChecked = app.isAnalyticsAllowed
 
-        analyticsOkayCheckbox.setOnCheckedChangeListener { _, isChecked ->
+        binding.analyticsOkayCheckbox.setOnCheckedChangeListener { _, isChecked ->
             debug("User changed analytics to $isChecked")
             app.isAnalyticsAllowed = isChecked
-            reportBugButton.isEnabled = app.isAnalyticsAllowed
+            binding.reportBugButton.isEnabled = app.isAnalyticsAllowed
         }
 
         // report bug button only enabled if analytics is allowed
-        reportBugButton.isEnabled = app.isAnalyticsAllowed
-        reportBugButton.setOnClickListener {
+        binding.reportBugButton.isEnabled = app.isAnalyticsAllowed
+        binding.reportBugButton.setOnClickListener {
             MaterialAlertDialogBuilder(requireContext())
                 .setTitle(R.string.report_a_bug)
                 .setMessage(getString(R.string.report_bug_text))
@@ -598,34 +632,34 @@ class SettingsFragment : ScreenFragment("Settings"), Logging {
         b.isEnabled = enabled
         b.isChecked =
             device.address == scanModel.selectedNotNull && device.bonded // Only show checkbox if device is still paired
-        deviceRadioGroup.addView(b)
+        binding.deviceRadioGroup.addView(b)
 
         // Once we have at least one device, don't show the "looking for" animation - it makes uers think
         // something is busted
-        scanProgressBar.visibility = View.INVISIBLE
+        binding.scanProgressBar.visibility = View.INVISIBLE
 
         b.setOnClickListener {
             if (!device.bonded) // If user just clicked on us, try to bond
-                scanStatusText.setText(R.string.starting_pairing)
+                binding.scanStatusText.setText(R.string.starting_pairing)
 
             b.isChecked =
                 scanModel.onSelected(requireActivity() as MainActivity, device)
 
             if (!b.isSelected)
-                scanStatusText.setText(getString(R.string.please_pair))
+                binding.scanStatusText.setText(getString(R.string.please_pair))
         }
     }
 
     /// Show the GUI for classic scanning
     private fun showClassicWidgets(visible: Int) {
-        scanProgressBar.visibility = visible
-        deviceRadioGroup.visibility = visible
+        binding.scanProgressBar.visibility = visible
+        binding.deviceRadioGroup.visibility = visible
     }
 
     /// Setup the GUI to do a classic (pre SDK 26 BLE scan)
     private fun initClassicScan() {
         // Turn off the widgets for the new API (we turn on/off hte classic widgets when we start scanning
-        changeRadioButton.visibility = View.GONE
+        binding.changeRadioButton.visibility = View.GONE
 
         showClassicWidgets(View.VISIBLE)
 
@@ -638,13 +672,13 @@ class SettingsFragment : ScreenFragment("Settings"), Logging {
 
         scanModel.errorText.observe(viewLifecycleOwner, Observer { errMsg ->
             if (errMsg != null) {
-                scanStatusText.text = errMsg
+                binding.scanStatusText.text = errMsg
             }
         })
 
         scanModel.devices.observe(viewLifecycleOwner, Observer { devices ->
             // Remove the old radio buttons and repopulate
-            deviceRadioGroup.removeAllViews()
+            binding.deviceRadioGroup.removeAllViews()
 
             val adapter = scanModel.bluetoothAdapter
 
@@ -658,9 +692,13 @@ class SettingsFragment : ScreenFragment("Settings"), Logging {
             // The device the user is already paired with is offline currently, still show it
             // it in the list, but greyed out
             if (!hasShownOurDevice) {
-                if (scanModel.selectedBluetooth != null && adapter != null && adapter.isEnabled) {
+                // Note: we pull this into a tempvar, because otherwise some other thread can change selectedAddress after our null check
+                // and before use
+                val bleAddr = scanModel.selectedBluetooth
+
+                if (bleAddr != null && adapter != null && adapter.isEnabled) {
                     val bDevice =
-                        adapter.getRemoteDevice(scanModel.selectedBluetooth)
+                        adapter.getRemoteDevice(bleAddr)
                     if (bDevice.name != null) { // ignore nodes that node have a name, that means we've lost them since they appeared
                         val curDevice = BTScanModel.DeviceListEntry(
                             bDevice.name,
@@ -684,14 +722,14 @@ class SettingsFragment : ScreenFragment("Settings"), Logging {
                 RadioInterfaceService.getBondedDeviceAddress(requireContext()) != null
 
             // get rid of the warning text once at least one device is paired
-            warningNotPaired.visibility = if (hasBonded) View.GONE else View.VISIBLE
+            binding.warningNotPaired.visibility = if (hasBonded) View.GONE else View.VISIBLE
         })
     }
 
     /// Start running the modern scan, once it has one result we enable the
     private fun startBackgroundScan() {
         // Disable the change button until our scan has some results
-        changeRadioButton.isEnabled = false
+        binding.changeRadioButton.isEnabled = false
 
         // To skip filtering based on name and supported feature flags (UUIDs),
         // don't include calls to setNamePattern() and addServiceUuid(),
@@ -720,8 +758,8 @@ class SettingsFragment : ScreenFragment("Settings"), Logging {
 
                 override fun onDeviceFound(chooserLauncher: IntentSender) {
                     debug("Found one device - enabling button")
-                    changeRadioButton.isEnabled = true
-                    changeRadioButton.setOnClickListener {
+                    binding.changeRadioButton.isEnabled = true
+                    binding.changeRadioButton.setOnClickListener {
                         debug("User clicked BLE change button")
 
                         // Request code seems to be ignored anyways
@@ -742,18 +780,18 @@ class SettingsFragment : ScreenFragment("Settings"), Logging {
 
     private fun initModernScan() {
         // Turn off the widgets for the classic API
-        scanProgressBar.visibility = View.GONE
-        deviceRadioGroup.visibility = View.GONE
-        changeRadioButton.visibility = View.VISIBLE
+        binding.scanProgressBar.visibility = View.GONE
+        binding.deviceRadioGroup.visibility = View.GONE
+        binding.changeRadioButton.visibility = View.VISIBLE
 
         val curRadio = RadioInterfaceService.getBondedDeviceAddress(requireContext())
 
         if (curRadio != null) {
-            scanStatusText.text = getString(R.string.current_pair).format(curRadio)
-            changeRadioButton.text = getString(R.string.change_radio)
+            binding.scanStatusText.text = getString(R.string.current_pair).format(curRadio)
+            binding.changeRadioButton.text = getString(R.string.change_radio)
         } else {
-            scanStatusText.text = getString(R.string.not_paired_yet)
-            changeRadioButton.setText(R.string.select_radio)
+            binding.scanStatusText.text = getString(R.string.not_paired_yet)
+            binding.changeRadioButton.setText(R.string.select_radio)
         }
 
         startBackgroundScan()
@@ -767,11 +805,6 @@ class SettingsFragment : ScreenFragment("Settings"), Logging {
             initModernScan()
         else
             initClassicScan()
-    }
-
-    override fun onPause() {
-        super.onPause()
-        scanModel.stopScan()
     }
 
     /**
@@ -796,7 +829,7 @@ class SettingsFragment : ScreenFragment("Settings"), Logging {
                 debug("We have location access")
             }
 
-            locationSettingsResponse.addOnFailureListener { exception ->
+            locationSettingsResponse.addOnFailureListener { _ ->
                 errormsg("Failed to get location access")
                 // We always show the toast regardless of what type of exception we receive.  Because even non
                 // resolvable api exceptions mean user still needs to fix something.
@@ -827,10 +860,28 @@ class SettingsFragment : ScreenFragment("Settings"), Logging {
         }
     }
 
+    private val updateProgressFilter = IntentFilter(ACTION_UPDATE_PROGRESS)
+
+    private val updateProgressReceiver: BroadcastReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            refreshUpdateButton()
+        }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        scanModel.stopScan()
+
+        requireActivity().unregisterReceiver(updateProgressReceiver)
+    }
+
     override fun onResume() {
         super.onResume()
+
         if (!hasCompanionDeviceApi)
             scanModel.startScan()
+
+        requireActivity().registerReceiver(updateProgressReceiver, updateProgressFilter)
 
         // Keep reminding user BLE is still off
         val hasUSB = activity?.let { SerialInterface.findDrivers(it).isNotEmpty() } ?: true

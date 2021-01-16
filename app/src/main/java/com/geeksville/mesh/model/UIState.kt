@@ -8,13 +8,20 @@ import android.os.RemoteException
 import android.view.Menu
 import androidx.core.content.edit
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.LiveData
 import androidx.lifecycle.MutableLiveData
+import androidx.lifecycle.viewModelScope
 import com.geeksville.android.BuildUtils.isEmulator
 import com.geeksville.android.Logging
 import com.geeksville.mesh.IMeshService
 import com.geeksville.mesh.MeshProtos
 import com.geeksville.mesh.MyNodeInfo
+import com.geeksville.mesh.database.MeshtasticDatabase
+import com.geeksville.mesh.database.PacketRepository
+import com.geeksville.mesh.database.entity.Packet
 import com.geeksville.mesh.service.MeshService
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 
 /// Given a human name, strip out the first letter of the first three words and return that as the initials for
 /// that user. If the original name is only one word, strip vowels from the original name and if the result is
@@ -28,7 +35,10 @@ fun getInitials(nameIn: String): String {
 
     val initials = when (words.size) {
         in 0..minchars - 1 -> {
-            val nm = name.filterNot { c -> c.toLowerCase() in "aeiou" }
+            val nm = if (name.length >= 1)
+                name.first() + name.drop(1).filterNot { c -> c.toLowerCase() in "aeiou" }
+            else
+                ""
             if (nm.length >= nchars) nm else name
         }
         else -> words.map { it.first() }.joinToString("")
@@ -37,8 +47,25 @@ fun getInitials(nameIn: String): String {
 }
 
 class UIViewModel(app: Application) : AndroidViewModel(app), Logging {
+
+    private val repository: PacketRepository
+
+    val allPackets: LiveData<List<Packet>>
+
     init {
+        val packetsDao = MeshtasticDatabase.getDatabase(app).packetDao()
+        repository = PacketRepository(packetsDao)
+        allPackets = repository.allPackets
         debug("ViewModel created")
+    }
+
+
+    fun insertPacket(packet: Packet) = viewModelScope.launch(Dispatchers.IO) {
+        repository.insert(packet)
+    }
+
+    fun deleteAllPacket() = viewModelScope.launch(Dispatchers.IO) {
+        repository.deleteAll()
     }
 
     companion object {
